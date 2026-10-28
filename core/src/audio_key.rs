@@ -5,7 +5,7 @@ use bytes::Bytes;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-use crate::{Error, FileId, SpotifyId, packet::PacketType, util::SeqGenerator};
+use crate::{Error, FileId, SpotifyId, error::ErrorKind, packet::PacketType, util::SeqGenerator};
 
 #[derive(Debug, Hash, PartialEq, Eq, Copy, Clone)]
 pub struct AudioKey(pub [u8; 16]);
@@ -78,7 +78,42 @@ impl AudioKeyManager {
         Ok(())
     }
 
+    /// Requests the AES key for a track, retrying transient rejections.
+    ///
+    /// Spotify rate-limits the AES key endpoint and answers with an `AesKeyError`
+    /// packet rather than an HTTP 429, so a rejection here is usually temporary.
+    /// Retrying lets the session recover. Without it the caller falls back to
+    /// "continuing without decryption", the decoder then fails on the still
+    /// encrypted file, and every skipped track issues the next request, which
+    /// keeps the limit pinned for as long as playback continues.
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        const BACKOFF: [Duration; 4] = [
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+        ];
+
+        let mut attempt = 0;
+        loop {
+            match self.request_once(track, file).await {
+                Err(err)
+                    if attempt < BACKOFF.len()
+                        && matches!(err.kind, ErrorKind::Unavailable | ErrorKind::Aborted) =>
+                {
+                    warn!(
+                        "Audio key request rejected ({err}), retrying in {:?}",
+                        BACKOFF[attempt]
+                    );
+                    tokio::time::sleep(BACKOFF[attempt]).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn request_once(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         let (tx, rx) = oneshot::channel();
 
         let seq = self.lock(move |inner| {
